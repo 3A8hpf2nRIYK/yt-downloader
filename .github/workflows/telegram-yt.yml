@@ -1,0 +1,400 @@
+# .github/workflows/telegram-yt.yml
+# Backend download untuk bot Telegram di Cloudflare Worker.
+#
+# Worker (frontend) trigger workflow ini lewat GitHub API
+# workflow_dispatch setiap kali user kirim link / pilih tombol:
+#   mode=list     -> jalankan `yt-dlp ... -F <link>` dan `yt-dlp -J`,
+#                    kirim foto thumbnail + tombol format ke Telegram
+#                    (hanya yang tersedia, sampai 4320p/8K, lengkap
+#                    dengan fps, ukuran perkiraan, 2 kolom, plus
+#                    audio MP3 / M4A dan tombol Batal)
+#   mode=download -> download kualitas yang dipilih sebagai MP4
+#                    (bv mp4 + m4a, --merge-output-format mp4) atau
+#                    audio MP3 / M4A, kirim file ke Telegram kalau
+#                    <= 50 MB, kalau tidak simpan sebagai artifact
+#                    dan kirim link run-nya.
+#
+# Kenapa webm dulu, kenapa sekarang mp4: selector lama `bv+ba`
+# tanpa batasan ext memilih video terbaik apa pun container-nya,
+# di YouTube itu sering vp9 (.webm) + opus (.webm), jadi hasil
+# .webm. Sekarang video dibatasi ke mp4 dulu
+# (`bv[ext=mp4]...+ba[ext=m4a]`), kalau tidak ada baru fallback
+# ke bv biasa dan di-remux ke mp4, jadi hasil .mp4.
+#
+# Perintah yt-dlp-nya sama seperti yt.sh:
+#   v1: yt-dlp --cookies mycookies.txt --js-runtimes node
+#           --remote-components ejs:github --sleep-requests 3 -F / -f <link>
+#   v2: yt-dlp --cookies mycookies.txt --js-runtimes deno
+#           --remote-components ejs:github --sleep-requests 3 -F / -f <link>
+# v1 dan v2 sekarang sama-sama pakai --sleep-requests 3 (sejak
+# 2026-11-23, atas permintaan Yao).
+# --cookies hanya dipakai kalau file mycookies.txt ada. File itu dibuat
+# dari secret repo COOKIES_TXT (isi file mycookies.txt kamu, format
+# Netscape). Kalau secret itu kosong, yt-dlp jalan tanpa cookies dan
+# kemungkinan lebih mudah kena bot.
+#
+# Secrets repo yang dibutuhkan (Settings > Secrets and variables > Actions):
+#   BOT_TOKEN   - token bot dari @BotFather (untuk balas ke Telegram)
+#   COOKIES_TXT - opsional, isi mycookies.txt
+
+name: Telegram yt-dlp
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "list atau download"
+        required: true
+        type: choice
+        options: [list, download]
+      url:
+        description: "Link YouTube, contoh: https://youtu.be/QQV-00UGxGs"
+        required: true
+        type: string
+      version:
+        description: "1 = node (v1), 2 = deno (v2)"
+        required: true
+        type: choice
+        options: ["1", "2"]
+      chat_id:
+        description: "Telegram chat id untuk membalas"
+        required: true
+        type: string
+      video_id:
+        description: "ID video YouTube (11 karakter)"
+        required: true
+        type: string
+      height:
+        description: "Tinggi video untuk mode download, contoh: 1080"
+        required: false
+        default: ""
+        type: string
+      fps:
+        description: "FPS untuk mode download, contoh: 60"
+        required: false
+        default: ""
+        type: string
+      audio:
+        description: "Audio saja untuk mode download: mp3 atau m4a, kosong untuk video"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ytdlp:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node (untuk v1)
+        if: inputs.version == '1'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+# v1 di GitHub Actions 2026-11-23 gagal menyelesaikan n challenge
+# dengan node saja (hanya storyboard sb0-sb3 yang muncul, padahal
+# COOKIES_TXT sudah ada dan v2 deno untuk video yang sama berhasil).
+# Karena itu Deno dipasang juga untuk v1, sebagai fallback: v1 tetap
+# dicoba dulu persis seperti perintah yang diminta, kalau hasilnya
+# cuma storyboard, workflow otomatis coba lagi pakai deno dan tombol
+# kualitas yang dikirim memakai versi deno itu, supaya download-nya
+# nanti juga pakai deno dan tidak gagal lagi dengan cara yang sama.
+
+      - name: Setup Deno (untuk v2, dan fallback v1)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install yt-dlp
+        run: |
+          python3 -m pip install -U yt-dlp
+          yt-dlp --version
+
+      - name: Install ffmpeg (untuk gabung video+audio)
+        id: ffmpeg
+        # Tanpa ffmpeg, yt-dlp download video dan audio terpisah
+        # (... [720p30].f398.mp4 dan ... [720p30].f140.m4a) dan
+        # tidak ter-merge jadi satu .mp4. Log run 45128005987
+        # 2026-11-23: "You have requested merging of multiple
+        # formats but ffmpeg is not installed."
+        # Run 45156998449 2026-11-23: step ini menggantung 4 mnt
+        # 15 dtk di `apt-get update -qq` tanpa output sama sekali,
+        # sampai user membatalkan run-nya. Karena itu step ini
+        # dibuat supaya tidak bisa menggantung lagi:
+        # - apt-get update TIDAK dijalankan duluan (daftar paket di
+        #   runner GitHub biasanya masih segar), dan install pakai
+        #   --no-install-recommends supaya download lebih kecil.
+        # - Setiap percobaan apt dibatasi `timeout 45`, jadi apt
+        #   yang menggantung tidak menahan run selamanya.
+        # - Kalau apt gagal/lambat, fallback ke imageio-ffmpeg
+        #   lewat pip (wheel ~24 MB, biasanya <30 detik), binary-nya
+        #   di-symlink ke /usr/local/bin/ffmpeg supaya yt-dlp
+        #   menemukannya. imageio-ffmpeg tidak menyediakan ffprobe,
+        #   tapi tidak apa-apa: telegram_send.py sudah fallback ke
+        #   height input kalau ffprobe tidak ada.
+        # - Step ini dibatasi timeout-minutes: 3. GitHub Actions
+        #   tidak bisa bertanya interaktif di tengah run ("stop atau
+        #   lanjut?"), jadi ini padanannya: setelah 3 menit step ini
+        #   berhenti sendiri, dan sebelum itu dia sudah mencoba
+        #   semua jalan cepat di atas. Kalau ffmpeg tetap tidak
+        #   ada, step gagal cepat (bukan menggantung) dan run bisa
+        #   diulang.
+        timeout-minutes: 3
+        run: |
+          if which ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg sudah ada: $(ffmpeg -version | head -1)"
+            exit 0
+          fi
+          echo "Coba install ffmpeg via apt (tanpa update, --no-install-recommends)..."
+          if timeout 45 sudo apt-get install -y -q --no-install-recommends ffmpeg; then
+            echo "ffmpeg terpasang via apt (tanpa update)."
+          else
+            echo "Install langsung gagal/lambat, coba apt-get update dulu..."
+            timeout 45 sudo apt-get update -q || true
+            if timeout 45 sudo apt-get install -y -q --no-install-recommends ffmpeg; then
+              echo "ffmpeg terpasang via apt (setelah update)."
+            else
+              echo "apt gagal/lambat, fallback ke imageio-ffmpeg via pip..."
+              python3 -m pip install -q imageio-ffmpeg
+              FF="$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")"
+              sudo ln -sf "$FF" /usr/local/bin/ffmpeg
+              echo "ffmpeg dari imageio-ffmpeg: $FF"
+            fi
+          fi
+          ffmpeg -version | head -1
+          which ffmpeg
+
+      - name: Beri tahu user kalau install ffmpeg gagal
+        # Lapis kedua (timeout-minutes: 3) menghentikan step di atas
+        # kalau ffmpeg tetap tidak terpasang setelah semua percobaan
+        # cepat. Kalau itu terjadi, run berhenti dan user tidak akan
+        # dapat apa-apa — jadi beri tahu dia langsung lewat bot.
+        # Pesan ini membawa tombol coba lagi, jadi user tinggal tap:
+        # - mode list -> tombol v1/v2 (callback ver:VIDEOID:1|2),
+        #   sama seperti tombol "Pilih versi" aslinya (tombol itu
+        #   juga tetap bisa ditekan ulang, Worker tidak menghapus
+        #   keyboard setelah ditekan — yang dihapus cuma tombol
+        #   Batal).
+        # - mode download -> tombol download ulang kualitas/audio
+        #   yang sama (callback dl:/au:), jadi tidak perlu ulang
+        #   dari daftar format. Tidak perlu kirim ulang link dan
+        #   tidak perlu buka GitHub Actions. Step ini jalan walau
+        #   step sebelumnya gagal/dibatalkan (if: always), tapi
+        #   hanya kalau memang step ffmpeg yang gagal/dibatalkan.
+        if: always() && (steps.ffmpeg.outcome == 'failure' || steps.ffmpeg.outcome == 'cancelled')
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          VIDEO_ID="${{ inputs.video_id }}"
+          MODE="${{ inputs.mode }}"
+          if [ "$MODE" = "download" ] && [ -n "${{ inputs.audio }}" ]; then
+            KB="{\"inline_keyboard\":[[{\"text\":\"Download ulang ${{ inputs.audio }}\",\"callback_data\":\"au:$VIDEO_ID:${{ inputs.version }}:${{ inputs.audio }}\"}]]}"
+            RETRY="Tap tombol di bawah ini untuk download ulang."
+          elif [ "$MODE" = "download" ]; then
+            KB="{\"inline_keyboard\":[[{\"text\":\"Download ulang ${{ inputs.height }}p${{ inputs.fps }}\",\"callback_data\":\"dl:$VIDEO_ID:${{ inputs.version }}:${{ inputs.height }}:${{ inputs.fps }}\"}]]}"
+            RETRY="Tap tombol di bawah ini untuk download ulang kualitas yang sama."
+          else
+            KB="{\"inline_keyboard\":[[{\"text\":\"v1 - node\",\"callback_data\":\"ver:$VIDEO_ID:1\"},{\"text\":\"v2 - deno\",\"callback_data\":\"ver:$VIDEO_ID:2\"}]]}"
+            RETRY="Tap lagi v1 atau v2 di bawah ini untuk coba lagi."
+          fi
+          MSG="⚠️ Install ffmpeg gagal/terlalu lama (batas 3 menit), jadi run ini dihentikan sebelum download.
+
+          $RETRY Tidak perlu kirim ulang linknya, tidak perlu buka GitHub Actions.
+
+          Run: https://github.com/l0sSC9t5nfhX/yt-dlp/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${{ inputs.chat_id }}" \
+            --data-urlencode "text=${MSG}" \
+            --data-urlencode "reply_markup=${KB}" || true
+
+      - name: Install Telethon (untuk kirim file >50 MB)
+        # Bot API mentok 50 MB; file yang lebih besar dikirim lewat
+        # Telethon/MTProto (maks 2 GB) pakai API_ID + API_HASH +
+        # SESSION_STRING dari secret. Kalau secret tidak ada,
+        # telegram_send.py fallback ke pesan artifact.
+        run: |
+          python3 -m pip install -U telethon
+          python3 -c "import telethon; print('telethon', telethon.__version__)"
+
+      - name: Tulis mycookies.txt dari secret
+        env:
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+        run: |
+          if [ -n "$COOKIES_TXT" ]; then
+            printf '%s' "$COOKIES_TXT" > mycookies.txt
+            echo "mycookies.txt ditulis dari secret COOKIES_TXT"
+          else
+            echo "Secret COOKIES_TXT kosong, jalan tanpa --cookies"
+          fi
+
+      - name: Ambil daftar format (-F)
+        if: inputs.mode == 'list'
+        env:
+          URL: ${{ inputs.url }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Retry otomatis, karena kegagalan di sini sering sementara:
+          # - HTTP 429: YouTube membatasi IP server GitHub Actions
+          #   (IP bersama). Run 45135694044 gagal 429 jam 15:04,
+          #   run 45136352121 untuk video yang sama berhasil jam 15:09.
+          #   Coba lagi setelah jeda 60 detik biasanya berhasil.
+          # - n challenge gagal dengan node: fallback ke deno.
+          # Total maksimal 3 percobaan, jeda 60 detik kalau kena 429,
+          # 15 detik kalau gagal karena sebab lain.
+          run_list() {
+            local runtime="$1"
+            if [ "$runtime" = "node" ]; then
+              CMD=(yt-dlp --js-runtimes node --remote-components ejs:github --sleep-requests 3)
+            else
+              CMD=(yt-dlp --js-runtimes deno --remote-components ejs:github --sleep-requests 3)
+            fi
+            if [ -f mycookies.txt ]; then CMD+=(--cookies mycookies.txt); fi
+            "${CMD[@]}" -F "$URL" > formats.txt 2>&1 || true
+            cat formats.txt
+          }
+          has_video() {
+            grep -qE '[0-9]+x(144|240|360|480|720|1080|1440|2160|4320)[[:space:]]' formats.txt
+          }
+          EV="$VERSION"
+          RUNTIME="deno"
+          [ "$VERSION" = "1" ] && RUNTIME="node"
+          NOTE=""
+          HIT429=0
+          for attempt in 1 2 3; do
+            echo "Percobaan $attempt (runtime: $RUNTIME)..."
+            run_list "$RUNTIME"
+            if has_video; then
+              echo "Berhasil di percobaan $attempt."
+              break
+            fi
+            if grep -q "429" formats.txt; then
+              HIT429=1
+              echo "YouTube 429 (Too Many Requests), tunggu 60 detik lalu coba lagi..."
+              [ "$attempt" = "3" ] || sleep 60
+            else
+              echo "Tidak ada format video, tunggu 15 detik lalu coba lagi..."
+              [ "$attempt" = "3" ] || sleep 15
+            fi
+            # Percobaan berikut: v1 pindah ke deno (node gagal n challenge
+            # atau 429), v2 tetap deno.
+            if [ "$VERSION" = "1" ] && [ "$RUNTIME" = "node" ]; then
+              if grep -q "n challenge solving failed" formats.txt; then
+                NOTE="v1 (node) gagal menyelesaikan JS challenge, dipakai deno."
+              fi
+              RUNTIME="deno"
+              EV=2
+            fi
+          done
+          if [ "$HIT429" = "1" ] && has_video; then
+            NOTE="Sempat kena batas YouTube (429), berhasil setelah dicoba lagi."
+          fi
+          echo "EFFECTIVE_VERSION=$EV" >> "$GITHUB_ENV"
+          echo "FALLBACK_NOTE=$NOTE" >> "$GITHUB_ENV"
+          # Metadata untuk tampilan (judul, channel, durasi, thumbnail,
+          # dan ukuran perkiraan yang akurat): yt-dlp -J.
+          # Pakai runtime yang efektif (node, atau deno kalau fallback).
+          if [ "$EV" = "1" ]; then
+            METACMD=(yt-dlp --js-runtimes node --remote-components ejs:github --sleep-requests 3)
+          else
+            METACMD=(yt-dlp --js-runtimes deno --remote-components ejs:github --sleep-requests 3)
+          fi
+          if [ -f mycookies.txt ]; then METACMD+=(--cookies mycookies.txt); fi
+          "${METACMD[@]}" -J --no-playlist --no-download "$URL" > info.json 2> info_err.txt || true
+          if [ -s info.json ]; then echo "info.json OK ($(wc -c < info.json) byte)"; else echo "info.json gagal, tampilkan fallback -F"; cat info_err.txt; fi
+
+      - name: Kirim tombol kualitas ke Telegram
+        if: inputs.mode == 'list'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          python3 scripts/telegram_formats.py \
+            --formats-file formats.txt \
+            --info-file info.json \
+            --chat-id "${{ inputs.chat_id }}" \
+            --video-id "${{ inputs.video_id }}" \
+            --version "${{ env.EFFECTIVE_VERSION }}" \
+            --note "${{ env.FALLBACK_NOTE }}"
+
+      - name: Download kualitas yang dipilih
+        if: inputs.mode == 'download'
+        env:
+          URL: ${{ inputs.url }}
+          VERSION: ${{ inputs.version }}
+          HEIGHT: ${{ inputs.height }}
+          FPS: ${{ inputs.fps }}
+          AUDIO: ${{ inputs.audio }}
+          # Untuk progress download di Telegram (scripts/yt_progress.py).
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          if [ "$VERSION" = "1" ]; then
+            CMD=(yt-dlp --js-runtimes node --remote-components ejs:github --sleep-requests 3)
+          else
+            CMD=(yt-dlp --js-runtimes deno --remote-components ejs:github --sleep-requests 3)
+          fi
+          if [ -f mycookies.txt ]; then CMD+=(--cookies mycookies.txt); fi
+          # yt-dlp dibungkus scripts/yt_progress.py supaya progress
+          # download tampil di Telegram (satu pesan, di-edit tiap
+          # >=5%): "Download video: 45% dari 577.9 MiB • 9.1 MiB/s •
+          # ETA 00:41", lalu "Download audio: ..." untuk file audio,
+          # lalu "Download selesai, mengirim ke Telegram...".
+          # Wrapper ini cuma meneruskan perintah dan exit code-nya;
+          # tanpa BOT_TOKEN/CHAT_ID dia jalan tanpa pesan progress.
+          if [ -n "$AUDIO" ]; then
+            # Audio saja: MP3 (konversi ke mp3 192k) atau M4A (asli).
+            if [ "$AUDIO" = "mp3" ]; then
+              python3 scripts/yt_progress.py "${CMD[@]}" -f "ba[ext=m4a]/ba" -x --audio-format mp3 --audio-quality 192K -o "%(title)s.%(ext)s" "$URL"
+            else
+              python3 scripts/yt_progress.py "${CMD[@]}" -f "ba[ext=m4a]/ba" -o "%(title)s.%(ext)s" "$URL"
+            fi
+          else
+            # Video MP4: utamakan video mp4 + audio m4a, kalau tidak ada
+            # baru fallback ke video apa pun dan di-remux ke mp4.
+            FORMAT="bv[ext=mp4][height=${HEIGHT}][fps<=${FPS}]+ba[ext=m4a]/bv[height=${HEIGHT}][fps<=${FPS}]+ba/b[ext=mp4][height=${HEIGHT}][fps<=${FPS}]"
+            python3 scripts/yt_progress.py "${CMD[@]}" -f "$FORMAT" --merge-output-format mp4 --remux-video mp4 -o "%(title)s [${HEIGHT}p${FPS}].%(ext)s" "$URL"
+          fi
+          ls -lh
+
+      - name: Kirim hasil ke Telegram
+        if: inputs.mode == 'download'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          # Jalur file besar (Telethon, maks 2 GB). Jangan pernah
+          # paste nilainya di chat/log — isi lewat repo Settings >
+          # Secrets and variables > Actions.
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+        run: |
+          python3 scripts/telegram_send.py \
+            --chat-id "${{ inputs.chat_id }}" \
+            --height "${{ inputs.height }}" \
+            --fps "${{ inputs.fps }}" \
+            --audio "${{ inputs.audio }}" \
+            --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Upload hasil sebagai artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-ytdlp-${{ inputs.mode }}-${{ github.run_id }}
+          path: |
+            formats.txt
+            info.json
+            *.mp4
+            *.webm
+            *.mkv
+            *.mp3
+            *.m4a
+          if-no-files-found: warn
+          retention-days: 1
