@@ -8,7 +8,7 @@
 # Isinya sama dengan worker/wrangler.toml, hanya `main` menunjuk ke
 # worker/src/index.js. Deploy dari folder worker/ tetap pakai
 # worker/wrangler.toml seperti biasa.
-name = "yt-dlp"
+name = "youtube-download"
 main = "worker/src/index.js"
 compatibility_date = "2026-11-23"
 workers_dev = true
