@@ -1,0 +1,18 @@
+# wrangler.toml - Cloudflare Worker bot Telegram yt-dlp
+name = "yt-dlp"
+main = "src/index.js"
+compatibility_date = "2026-11-23"
+workers_dev = true
+
+[vars]
+GITHUB_OWNER = "l0sSC9t5nfhX"
+GITHUB_REPO = "yt-dlp"
+WORKFLOW_FILE = "telegram-yt.yml"
+# Isi dengan Telegram user id kamu (angka, contoh "123456789") supaya
+# bot cuma bisa dipakai kamu. Kosongkan = siapa pun bisa trigger Actions.
+ALLOWED_USER_ID = ""
+
+# Secrets - JANGAN tulis nilainya di file ini. Isi lewat:
+#   npx wrangler secret put BOT_TOKEN
+#   npx wrangler secret put GITHUB_TOKEN
+#   npx wrangler secret put WEBHOOK_SECRET   # opsional

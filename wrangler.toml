@@ -1,0 +1,26 @@
+# wrangler.toml - di root repo
+# Supaya `npx wrangler deploy` yang dijalankan Cloudflare dari root repo
+# (saat repo di-connect ke Cloudflare) menemukan config ini.
+# Sebelum file ini ada, Cloudflare tidak menemukan wrangler.toml di root,
+# mengira ini project Pages/static, dan gagal dengan:
+#   "Could not detect a directory containing static files"
+#
+# Isinya sama dengan worker/wrangler.toml, hanya `main` menunjuk ke
+# worker/src/index.js. Deploy dari folder worker/ tetap pakai
+# worker/wrangler.toml seperti biasa.
+name = "yt-dlp"
+main = "worker/src/index.js"
+compatibility_date = "2026-11-23"
+workers_dev = true
+
+[vars]
+GITHUB_OWNER = "l0sSC9t5nfhX"
+GITHUB_REPO = "yt-dlp"
+WORKFLOW_FILE = "telegram-yt.yml"
+# Isi dengan Telegram user id kamu (angka) supaya bot cuma bisa dipakai kamu.
+ALLOWED_USER_ID = ""
+
+# Secrets - JANGAN tulis nilainya di file ini. Isi lewat:
+#   npx wrangler secret put BOT_TOKEN
+#   npx wrangler secret put GITHUB_TOKEN
+#   npx wrangler secret put WEBHOOK_SECRET   # opsional
