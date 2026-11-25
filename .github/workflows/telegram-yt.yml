@@ -211,7 +211,7 @@ jobs:
 
           $RETRY Tidak perlu kirim ulang linknya, tidak perlu buka GitHub Actions.
 
-          Run: https://github.com/l0sSC9t5nfhX/yt-dlp/actions/runs/${{ github.run_id }}"
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${{ inputs.chat_id }}" \
             --data-urlencode "text=${MSG}" \
@@ -238,6 +238,7 @@ jobs:
           fi
 
       - name: Ambil daftar format (-F)
+        id: ambil_format
         if: inputs.mode == 'list'
         env:
           URL: ${{ inputs.url }}
@@ -313,19 +314,28 @@ jobs:
           if [ -s info.json ]; then echo "info.json OK ($(wc -c < info.json) byte)"; else echo "info.json gagal, tampilkan fallback -F"; cat info_err.txt; fi
 
       - name: Kirim tombol kualitas ke Telegram
+        id: kirim_tombol
         if: inputs.mode == 'list'
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
+          # --chat-id= dan --video-id= WAJIB pakai bentuk "=": chat id
+          # grup Telegram diawali "-" (mis. -100...) dan sebagian video
+          # id juga diawali "-" (mis. -fcMjtbtA4I, run 45615000222 dan
+          # 45615669405, 2026-11-25). Dengan bentuk spasi, argparse
+          # menganggap nilai itu opsi baru dan error "argument
+          # --video-id: expected one argument" (exit 2) sebelum tombol
+          # sempat dikirim.
           python3 scripts/telegram_formats.py \
             --formats-file formats.txt \
             --info-file info.json \
-            --chat-id "${{ inputs.chat_id }}" \
-            --video-id "${{ inputs.video_id }}" \
+            --chat-id="${{ inputs.chat_id }}" \
+            --video-id="${{ inputs.video_id }}" \
             --version "${{ env.EFFECTIVE_VERSION }}" \
             --note "${{ env.FALLBACK_NOTE }}"
 
       - name: Download kualitas yang dipilih
+        id: download
         if: inputs.mode == 'download'
         env:
           URL: ${{ inputs.url }}
@@ -366,6 +376,7 @@ jobs:
           ls -lh
 
       - name: Kirim hasil ke Telegram
+        id: kirim_hasil
         if: inputs.mode == 'download'
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -377,7 +388,7 @@ jobs:
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
         run: |
           python3 scripts/telegram_send.py \
-            --chat-id "${{ inputs.chat_id }}" \
+            --chat-id="${{ inputs.chat_id }}" \
             --height "${{ inputs.height }}" \
             --fps "${{ inputs.fps }}" \
             --audio "${{ inputs.audio }}" \
@@ -398,3 +409,61 @@ jobs:
             *.m4a
           if-no-files-found: warn
           retention-days: 1
+
+      - name: Beri tahu user kalau run gagal
+        # Notifikasi umum: step mana pun yang gagal (atau run dibatalkan)
+        # selain install ffmpeg — step ffmpeg sudah punya notifikasi
+        # khususnya sendiri di atas, jadi step ini dilewati untuk kasus
+        # itu supaya user tidak dapat pesan ganda. Tanpa step ini, run
+        # yang gagal seperti 45615000222 / 45615669405 (2026-11-25,
+        # error argparse --video-id) berhenti diam-diam: user cuma
+        # menunggu tombol/download yang tidak pernah datang.
+        # Pesan membawa tombol coba lagi yang sama seperti notifikasi
+        # ffmpeg: mode list -> v1/v2 (ver:), download -> kualitas/audio
+        # yang sama (dl:/au:), jadi tidak perlu kirim ulang link.
+        if: always() && (failure() || cancelled()) && steps.ffmpeg.outcome != 'failure' && steps.ffmpeg.outcome != 'cancelled'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OUTCOME_AMBIL_FORMAT: ${{ steps.ambil_format.outcome }}
+          OUTCOME_KIRIM_TOMBOL: ${{ steps.kirim_tombol.outcome }}
+          OUTCOME_DOWNLOAD: ${{ steps.download.outcome }}
+          OUTCOME_KIRIM_HASIL: ${{ steps.kirim_hasil.outcome }}
+        run: |
+          VIDEO_ID="${{ inputs.video_id }}"
+          MODE="${{ inputs.mode }}"
+          TAHAP=""
+          for pair in "Ambil daftar format:$OUTCOME_AMBIL_FORMAT" "Kirim tombol kualitas:$OUTCOME_KIRIM_TOMBOL" "Download:$OUTCOME_DOWNLOAD" "Kirim hasil ke Telegram:$OUTCOME_KIRIM_HASIL"; do
+            nama="${pair%%:*}"
+            hasil="${pair##*:}"
+            if [ "$hasil" = "failure" ] || [ "$hasil" = "cancelled" ]; then
+              TAHAP="$nama"
+            fi
+          done
+          if [ -z "$TAHAP" ]; then
+            TAHAP="salah satu tahap awal (install/setup)"
+          fi
+          if [ "$MODE" = "download" ] && [ -n "${{ inputs.audio }}" ]; then
+            KB="{\"inline_keyboard\":[[{\"text\":\"Download ulang ${{ inputs.audio }}\",\"callback_data\":\"au:$VIDEO_ID:${{ inputs.version }}:${{ inputs.audio }}\"}]]}"
+            RETRY="Tap tombol di bawah ini untuk download ulang."
+            JUDUL="❌ Download audio gagal."
+          elif [ "$MODE" = "download" ]; then
+            KB="{\"inline_keyboard\":[[{\"text\":\"Download ulang ${{ inputs.height }}p${{ inputs.fps }}\",\"callback_data\":\"dl:$VIDEO_ID:${{ inputs.version }}:${{ inputs.height }}:${{ inputs.fps }}\"}]]}"
+            RETRY="Tap tombol di bawah ini untuk download ulang kualitas yang sama."
+            JUDUL="❌ Download gagal."
+          else
+            KB="{\"inline_keyboard\":[[{\"text\":\"v1 - node\",\"callback_data\":\"ver:$VIDEO_ID:1\"},{\"text\":\"v2 - deno\",\"callback_data\":\"ver:$VIDEO_ID:2\"}]]}"
+            RETRY="Tap lagi v1 atau v2 di bawah ini untuk coba lagi."
+            JUDUL="❌ Gagal mengambil daftar kualitas."
+          fi
+          MSG="$JUDUL
+
+          Video: ${{ inputs.url }}
+          Tahap yang gagal: $TAHAP
+
+          $RETRY Tidak perlu kirim ulang linknya, tidak perlu buka GitHub Actions.
+
+          Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${{ inputs.chat_id }}" \
+            --data-urlencode "text=${MSG}" \
+            --data-urlencode "reply_markup=${KB}" || true
